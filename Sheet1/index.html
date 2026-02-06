@@ -1,0 +1,1429 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+/*
+  Normal-mode-first character sheet
+  - Always visible data (not only terminal output)
+  - CP allocation into Skills, Vit, Ast, Feats
+  - Skills lock at 10, 25, 40 until specialization is chosen
+  - Specialization is free and promotes +1 level (10→11, 25→26, 40→41)
+  - Base attributes are immutable; Body/Mind/Spirit are mins of pairs
+  - MP may go negative (overspend) which shows an auto status
+*/
+
+const WS_URL = "";
+
+const PLAYER_ALLOWED_MUTATIONS = new Set([
+  "add_item",
+  "remove_item",
+  "note",
+  "set_portrait",
+  "skill_delta",
+  "vit_delta",
+  "ast_delta",
+  "feat_buy",
+  "feat_sell",
+  "spec_choose",
+]);
+
+// Inline "files"
+const CONDITIONS = [
+  { id: "poisoned", label: "Poisoned" },
+  { id: "paralyzed", label: "Paralyzed" },
+  { id: "petrified", label: "Petrified" },
+  { id: "bleeding", label: "Bleeding" },
+  { id: "fatigued", label: "Fatigued" },
+];
+
+const SKILL_DEFS = [
+  {
+    id: "melee_weapons",
+    baseName: "Melee Weapons",
+    domain: "Melee",
+    specs: {
+      10: ["Axeman", "Swordsman", "Lancer"],
+      25: ["Executioner", "Blademaster", "Dragoon"],
+      40: ["Warlord", "Duel Saint", "Sky Reaver"],
+    },
+  },
+  {
+    id: "archery",
+    baseName: "Archery",
+    domain: "Ranged",
+    specs: {
+      10: ["Bow", "Crossbow", "Thrown"],
+      25: ["Eagle Eye", "Siege", "Trickshot"],
+      40: ["Storm Archer", "Ballista", "Void Needle"],
+    },
+  },
+  {
+    id: "alchemy",
+    baseName: "Alchemy",
+    domain: "Craft",
+    specs: {
+      10: ["Brewer", "Toxicologist", "Reagent"],
+      25: ["Panacea", "Plague", "Transmuter"],
+      40: ["Philosopher", "Chimera", "Goldleaf"],
+    },
+  },
+];
+
+const FEATS = [
+  { id: "quick_hands", name: "Quick Hands", cost: 3, tag: "Utility" },
+  { id: "iron_will", name: "Iron Will", cost: 4, tag: "Spirit" },
+  { id: "battle_focus", name: "Battle Focus", cost: 5, tag: "Combat" },
+];
+
+const NL = String.fromCharCode(10);
+
+function nowStamp() {
+  const d = new Date();
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+function uid() {
+  return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
+}
+
+function clampInt(n, min, max) {
+  const x = Math.floor(Number(n));
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, x));
+}
+
+function norm(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function cpTotalForLevel(level) {
+  const L = Math.max(1, Math.floor(level || 1));
+  if (L <= 50) return L * 10;
+  if (L <= 100) return 50 * 10 + (L - 50) * 15;
+  return 50 * 10 + 50 * 15 + (L - 100) * 20;
+}
+
+function isMilestone(level) {
+  return level === 10 || level === 25 || level === 40;
+}
+
+function buildDefaultSkills() {
+  const skills = {};
+  for (const def of SKILL_DEFS) {
+    skills[def.id] = {
+      id: def.id,
+      baseName: def.baseName,
+      domain: def.domain,
+      displayName: def.baseName,
+      level: 0,
+      pendingMilestone: null,
+      lineage: def.baseName,
+      chosen: [],
+    };
+  }
+  return skills;
+}
+
+const DEFAULT_SHEET = {
+  id: "char-" + uid(),
+  name: "Adventurer",
+  level: 1,
+
+  hp: { current: 10, max: 10 },
+  mp: { current: 6, max: 6 },
+
+  attrs: { STR: 10, AGI: 10, INT: 10, PER: 10, WIS: 10, CHA: 10 },
+
+  vit: 0,
+  ast: 0,
+  skills: buildDefaultSkills(),
+  featsOwned: [],
+
+  gold: 0,
+  inventory: ["Torch x2", "Rations x3"],
+  notes: ["Type help to see commands.", "Core: spend CP into skills, vit, ast, feats."],
+
+  conditions: [],
+
+  portraitUrl:
+    "data:image/svg+xml;charset=utf-8," +
+    encodeURIComponent(
+      `<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'>
+        <defs>
+          <linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
+            <stop offset='0' stop-color='#111827'/>
+            <stop offset='1' stop-color='#0f172a'/>
+          </linearGradient>
+        </defs>
+        <rect width='100%' height='100%' fill='url(#g)'/>
+        <circle cx='256' cy='210' r='92' fill='#e5e7eb' opacity='0.92'/>
+        <rect x='140' y='318' width='232' height='118' rx='58' fill='#e5e7eb' opacity='0.92'/>
+        <text x='256' y='470' font-family='ui-monospace, SFMono-Regular, Menlo, monospace' font-size='22' text-anchor='middle' fill='#9ca3af'>PORTRAIT</text>
+      </svg>`
+    ),
+};
+
+function derived(sheet) {
+  const a = sheet.attrs;
+  const body = Math.min(a.STR, a.AGI);
+  const mind = Math.min(a.INT, a.PER);
+  const spirit = Math.min(a.WIS, a.CHA);
+
+  const cpTotal = cpTotalForLevel(sheet.level);
+
+  const skillsSpent = Object.values(sheet.skills || {}).reduce((sum, sk) => sum + Math.max(0, sk.level || 0), 0);
+  const featsSpent = (sheet.featsOwned || []).reduce((sum, id) => {
+    const f = FEATS.find((x) => x.id === id);
+    return sum + (f ? f.cost : 0);
+  }, 0);
+
+  const cpSpent = (sheet.vit || 0) + (sheet.ast || 0) + skillsSpent + featsSpent;
+  const cpRemaining = cpTotal - cpSpent;
+
+  const statuses = [];
+  if (sheet.hp.current < sheet.hp.max) statuses.push("Wounded");
+  if (sheet.mp.current < 0) statuses.push("Dizzy");
+  if (!statuses.length) statuses.push("Good");
+
+  const condLabels = (sheet.conditions || [])
+    .map((id) => CONDITIONS.find((c) => c.id === id))
+    .filter(Boolean)
+    .map((c) => c.label);
+
+  const pendingSpecs = Object.values(sheet.skills || {})
+    .filter((sk) => sk.pendingMilestone)
+    .map((sk) => ({ id: sk.id, baseName: sk.baseName, at: sk.pendingMilestone, displayName: sk.displayName }));
+
+  const cpRate = sheet.level >= 101 ? 20 : sheet.level >= 51 ? 15 : 10;
+
+  return {
+    body,
+    mind,
+    spirit,
+    cpTotal,
+    cpSpent,
+    cpRemaining,
+    cpRate,
+    skillsSpent,
+    featsSpent,
+    statuses,
+    condLabels,
+    pendingSpecs,
+  };
+}
+
+function applyDmPatch(sheet, patch) {
+  const next = structuredClone(sheet);
+
+  if (typeof patch.name === "string") next.name = patch.name;
+
+  if (typeof patch.level === "number") next.level = clampInt(patch.level, 1, 999);
+
+  if (patch.hp && typeof patch.hp === "object") {
+    if (typeof patch.hp.max === "number") next.hp.max = Math.max(1, Math.floor(patch.hp.max));
+    if (typeof patch.hp.current === "number") next.hp.current = Math.floor(patch.hp.current);
+    next.hp.current = Math.min(next.hp.current, next.hp.max);
+  }
+
+  if (patch.mp && typeof patch.mp === "object") {
+    if (typeof patch.mp.max === "number") next.mp.max = Math.max(0, Math.floor(patch.mp.max));
+    if (typeof patch.mp.current === "number") next.mp.current = Math.floor(patch.mp.current);
+    next.mp.current = Math.min(next.mp.current, next.mp.max);
+  }
+
+  if (Array.isArray(patch.conditions)) {
+    const allowed = new Set(CONDITIONS.map((c) => c.id));
+    next.conditions = patch.conditions.filter((id) => allowed.has(id));
+  }
+
+  if (typeof patch.goldDelta === "number") next.gold = Math.max(0, next.gold + patch.goldDelta);
+  if (typeof patch.gold === "number") next.gold = Math.max(0, patch.gold);
+
+  if (Array.isArray(patch.addItems)) {
+    for (const item of patch.addItems) {
+      if (typeof item === "string" && item.trim()) next.inventory.push(item.trim());
+    }
+  }
+
+  if (Array.isArray(patch.removeItems)) {
+    const toRemove = new Set(patch.removeItems.filter((x) => typeof x === "string").map((x) => x.trim()));
+    next.inventory = next.inventory.filter((x) => !toRemove.has(x.trim()));
+  }
+
+  if (typeof patch.portraitUrl === "string" && patch.portraitUrl.trim()) next.portraitUrl = patch.portraitUrl.trim();
+
+  if (typeof patch.note === "string" && patch.note.trim()) next.notes.unshift(patch.note.trim());
+
+  return next;
+}
+
+function findSkillByUserInput(sheet, input) {
+  const q = norm(input);
+  if (!q) return null;
+
+  const skills = sheet.skills || {};
+  const entries = Object.entries(skills);
+
+  let best = null;
+  for (const [id, sk] of entries) {
+    const cand = [id, sk.baseName, sk.displayName, sk.domain].filter(Boolean).map(norm);
+    if (cand.some((x) => x === q)) return { id, sk };
+    if (!best && cand.some((x) => x.includes(q) || q.includes(x))) best = { id, sk };
+  }
+  return best;
+}
+
+function formatNormalSheet(sheet) {
+  const d = derived(sheet);
+  const a = sheet.attrs;
+
+  const cond = d.condLabels.length ? d.condLabels.join(", ") : "None";
+  const status = d.statuses.join(", ");
+
+  const header = [
+    `NAME   ${sheet.name}`,
+    `LEVEL  ${sheet.level}`,
+    `CP     ${d.cpSpent}/${d.cpTotal}  (rem ${d.cpRemaining}, rate +${d.cpRate}/lvl)`,
+    `HP     ${sheet.hp.current}/${sheet.hp.max}`,
+    `MP     ${sheet.mp.current}/${sheet.mp.max}`,
+    `STATE  ${status}  |  Cond: ${cond}`,
+  ].join(NL);
+
+  const primary = `Body ${d.body}  Mind ${d.mind}  Spirit ${d.spirit}`;
+  const attrs = `STR ${a.STR}  AGI ${a.AGI}  INT ${a.INT}  PER ${a.PER}  WIS ${a.WIS}  CHA ${a.CHA}`;
+  const sinks = `VIT ${sheet.vit}   AST ${sheet.ast}`;
+
+  const pending = d.pendingSpecs.length
+    ? d.pendingSpecs.map((p) => `  * ${p.displayName} (at ${p.at}) -> choose specialization`).join(NL)
+    : "  (none)";
+
+  const skills = Object.values(sheet.skills || {})
+    .sort((x, y) => (x.domain + x.displayName).localeCompare(y.domain + y.displayName))
+    .map((sk) => {
+      const lock = sk.pendingMilestone ? `  [LOCKED @${sk.pendingMilestone}]` : "";
+      return `  - ${sk.displayName} ${String(sk.level).padStart(2, " ")}${lock}`;
+    })
+    .join(NL);
+
+  const feats = (sheet.featsOwned || []).length
+    ? sheet.featsOwned
+        .map((id) => FEATS.find((f) => f.id === id))
+        .filter(Boolean)
+        .map((f) => `  - ${f.name} (${f.cost} CP)`)
+        .join(NL)
+    : "  (none)";
+
+  return [
+    header,
+    "",
+    primary,
+    attrs,
+    "",
+    sinks,
+    "",
+    "PENDING SPECIALIZATIONS",
+    pending,
+    "",
+    "SKILLS",
+    skills,
+    "",
+    "FEATS",
+    feats,
+  ].join(NL);
+}
+
+function splitArgs(line) {
+  const parts = [];
+  let cur = "";
+  let inQuote = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (!inQuote && ch === " ") {
+      if (cur) parts.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+function parseSignedInt(token) {
+  if (!token) return null;
+  const s = String(token).trim();
+  if (s.length < 2) return null;
+  const signChar = s[0];
+  if (signChar !== "+" && signChar !== "-") return null;
+  const n = Number(s.slice(1));
+  if (!Number.isFinite(n)) return null;
+  return (signChar === "+" ? 1 : -1) * Math.floor(n);
+}
+
+function helpText(role) {
+  const common = [
+    "Commands:",
+    "  sheet                 Show normal sheet (terminal view)",
+    "  clear                 Clear the terminal",
+    "  help                  Show this help",
+    "  whoami                Show current role + connection",
+    "  connect <url>         Connect WebSocket (DM server)",
+    "  disconnect            Disconnect WebSocket",
+    "  request <json>        Send raw JSON to server",
+  ];
+
+  const player = [
+    "",
+    "Player:",
+    "  add item <name>",
+    "  remove item <name>",
+    "  note <text>",
+    "  portrait <url>",
+    "",
+    "Build (CP):",
+    "  cp                    Show CP summary",
+    "  skills                List skills",
+    "  skill +N <name>        Increase skill",
+    "  skill -N <name>        Decrease skill (refund)",
+    "  vit +N | vit -N        Adjust vitality",
+    "  ast +N | ast -N        Adjust astra",
+    "  feats                 Show feats catalog + owned",
+    "  feat buy <id>          Buy feat",
+    "  feat sell <id>         Sell feat",
+    "  spec <skill>           Show specialization options (if pending)",
+    "  spec <skill> <choice>  Choose specialization (free, +1 level)",
+  ];
+
+  const dm = [
+    "",
+    "DM:",
+    "  set name <value>",
+    "  set level <value>",
+    "  set hp <cur>/<max>",
+    "  set mp <cur>/<max>",
+    "  cond add <id>          Add condition",
+    "  cond rm <id>           Remove condition",
+    "  patch <json>           Apply patch",
+  ];
+
+  const out = [...common];
+  if (role === "PLAYER") out.push(...player);
+  if (role === "DM") out.push(...dm);
+  return out.join(NL);
+}
+
+export default function MudCharacterSheet() {
+  const [role, setRole] = useState("PLAYER");
+
+  const [sheet, setSheet] = useState(() => {
+    const saved = safeJsonParse(localStorage.getItem("mud_sheet_v2"));
+    return saved && saved.id && saved.skills ? saved : DEFAULT_SHEET;
+  });
+
+  const [terminal, setTerminal] = useState(() => {
+    const saved = safeJsonParse(localStorage.getItem("mud_terminal"));
+    return Array.isArray(saved) ? saved : [];
+  });
+
+  const [input, setInput] = useState("");
+  const [wsUrl, setWsUrl] = useState(() => localStorage.getItem("mud_ws_url") || WS_URL);
+  const [connected, setConnected] = useState(false);
+  const [lastDmPing, setLastDmPing] = useState(null);
+
+  const wsRef = useRef(null);
+  const scrollRef = useRef(null);
+  const historyRef = useRef({ list: [], idx: -1 });
+
+  const d = useMemo(() => derived(sheet), [sheet]);
+
+  useEffect(() => {
+    localStorage.setItem("mud_sheet_v2", JSON.stringify(sheet));
+  }, [sheet]);
+
+  useEffect(() => {
+    localStorage.setItem("mud_terminal", JSON.stringify(terminal.slice(-300)));
+  }, [terminal]);
+
+  useEffect(() => {
+    localStorage.setItem("mud_ws_url", wsUrl || "");
+  }, [wsUrl]);
+
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [terminal.length]);
+
+  const statusText = useMemo(() => {
+    if (!wsUrl) return "OFFLINE";
+    if (!connected) return "DISCONNECTED";
+    const dm = lastDmPing ? `DM:${new Date(lastDmPing).toLocaleTimeString()}` : "DM:?";
+    return `CONNECTED (${dm})`;
+  }, [connected, wsUrl, lastDmPing]);
+
+  function pushLine(kind, text) {
+    setTerminal((t) => [...t, { id: uid(), ts: nowStamp(), kind, text }].slice(-600));
+  }
+
+  function connect(url = wsUrl) {
+    if (!url) {
+      pushLine("err", "No URL provided. Try: connect wss://.../ws");
+      return;
+    }
+    try {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setConnected(true);
+        pushLine("sys", `Connected to ${url}`);
+        ws.send(
+          JSON.stringify({
+            type: "hello",
+            role,
+            characterId: sheet.id,
+            name: sheet.name,
+            ts: Date.now(),
+          })
+        );
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        pushLine("sys", "Disconnected.");
+      };
+
+      ws.onerror = () => {
+        pushLine("err", "WebSocket error.");
+      };
+
+      ws.onmessage = (ev) => {
+        const msg = safeJsonParse(ev.data);
+        if (!msg || typeof msg.type !== "string") {
+          pushLine("dm", `DM: ${String(ev.data).slice(0, 300)}`);
+          return;
+        }
+
+        if (msg.type === "dm_notice" && typeof msg.text === "string") {
+          setLastDmPing(Date.now());
+          pushLine("dm", msg.text);
+          return;
+        }
+
+        if (msg.type === "dm_patch" && msg.patch && typeof msg.patch === "object") {
+          setLastDmPing(Date.now());
+          setSheet((s) => applyDmPatch(s, msg.patch));
+          pushLine("dm", `Applied DM patch: ${JSON.stringify(msg.patch)}`);
+          return;
+        }
+
+        if (msg.type === "ack" && typeof msg.requestId === "string") {
+          setLastDmPing(Date.now());
+          pushLine("sys", `DM acknowledged request ${msg.requestId}`);
+          return;
+        }
+
+        pushLine("dm", `DM message: ${JSON.stringify(msg)}`);
+      };
+    } catch (e) {
+      pushLine("err", `Could not connect: ${String(e)}`);
+    }
+  }
+
+  function disconnect() {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setConnected(false);
+  }
+
+  function send(msg) {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== 1) {
+      pushLine("err", "Not connected.");
+      return false;
+    }
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+
+  function requestAction(action) {
+    const requestId = uid();
+    const msg = {
+      type: "player_request",
+      characterId: sheet.id,
+      requestId,
+      action,
+      ts: Date.now(),
+    };
+    const ok = send(msg);
+    if (ok) pushLine("sys", `Sent request ${requestId}: ${JSON.stringify(action)}`);
+    return ok;
+  }
+
+  function runLocalOrRequest(kind, applyLocal, requestPayload) {
+    if (role === "DM") {
+      setSheet((s) => applyLocal(s));
+      return;
+    }
+
+    if (!PLAYER_ALLOWED_MUTATIONS.has(kind)) {
+      pushLine("err", "Players are not allowed to do that.");
+      return;
+    }
+
+    setSheet((s) => applyLocal(s));
+    if (connected) requestAction(requestPayload);
+    else pushLine("sys", "(offline) Applied locally; will not sync without a DM connection.");
+  }
+
+  function ensureBudget(nextSheet) {
+    const dd = derived(nextSheet);
+    return dd.cpRemaining >= 0 ? { ok: true, dd } : { ok: false, dd };
+  }
+
+  function applyVitDelta(s, delta) {
+    const next = structuredClone(s);
+    next.vit = Math.max(0, (next.vit || 0) + delta);
+    return next;
+  }
+
+  function applyAstDelta(s, delta) {
+    const next = structuredClone(s);
+    next.ast = Math.max(0, (next.ast || 0) + delta);
+    return next;
+  }
+
+  function applySkillDelta(s, skillId, delta) {
+    const next = structuredClone(s);
+    const sk = next.skills && next.skills[skillId];
+    if (!sk) return next;
+
+    if (delta < 0) {
+      sk.level = Math.max(0, sk.level + delta);
+      if (sk.pendingMilestone && sk.level < sk.pendingMilestone) sk.pendingMilestone = null;
+      return next;
+    }
+
+    if (sk.pendingMilestone) return next;
+
+    for (let i = 0; i < delta; i++) {
+      sk.level += 1;
+      if (isMilestone(sk.level)) {
+        sk.pendingMilestone = sk.level;
+        break;
+      }
+    }
+
+    return next;
+  }
+
+  function chooseSpec(s, skillId, choiceName) {
+    const next = structuredClone(s);
+    const sk = next.skills && next.skills[skillId];
+    if (!sk || !sk.pendingMilestone) return next;
+
+    const def = SKILL_DEFS.find((x) => x.id === skillId);
+    if (!def) return next;
+
+    const ms = sk.pendingMilestone;
+    const opts = def.specs && def.specs[ms] ? def.specs[ms] : [];
+    const choice = opts.find((x) => norm(x) === norm(choiceName));
+    if (!choice) return next;
+
+    sk.chosen = [...(sk.chosen || []), { milestone: ms, choice }];
+    sk.displayName = `${def.domain} : ${choice}`;
+    sk.lineage = `${def.baseName} -> ${sk.displayName}`;
+    sk.level = sk.level + 1;
+    sk.pendingMilestone = null;
+
+    return next;
+  }
+
+  function buyFeat(s, featId) {
+    const next = structuredClone(s);
+    const f = FEATS.find((x) => x.id === featId);
+    if (!f) return next;
+    const set = new Set(next.featsOwned || []);
+    set.add(f.id);
+    next.featsOwned = Array.from(set);
+    return next;
+  }
+
+  function sellFeat(s, featId) {
+    const next = structuredClone(s);
+    next.featsOwned = (next.featsOwned || []).filter((x) => x !== featId);
+    return next;
+  }
+
+  function parseHpMpPair(value) {
+    const t = String(value || "").trim();
+    const parts = t.split("/");
+    if (parts.length !== 2) return null;
+    const cur = Number(parts[0]);
+    const max = Number(parts[1]);
+    if (!Number.isFinite(cur) || !Number.isFinite(max)) return null;
+    return { cur: Math.floor(cur), max: Math.floor(max) };
+  }
+
+  function handleCommand(raw) {
+    const line = String(raw || "").trim();
+    if (!line) return;
+
+    pushLine("cmd", `> ${line}`);
+
+    const parts = splitArgs(line);
+    const cmd = parts[0] ? parts[0].toLowerCase() : "";
+
+    if (cmd === "help") {
+      pushLine("out", helpText(role));
+      return;
+    }
+
+    if (cmd === "sheet") {
+      pushLine("out", formatNormalSheet(sheet));
+      return;
+    }
+
+    if (cmd === "cp") {
+      pushLine(
+        "out",
+        [
+          `CP ${d.cpSpent}/${d.cpTotal} (rem ${d.cpRemaining})`,
+          `Spent: skills ${d.skillsSpent}, vit ${sheet.vit}, ast ${sheet.ast}, feats ${d.featsSpent}`,
+        ].join(NL)
+      );
+      return;
+    }
+
+    if (cmd === "skills") {
+      const lines = Object.values(sheet.skills || {})
+        .sort((a, b) => (a.domain + a.displayName).localeCompare(b.domain + b.displayName))
+        .map((sk) => {
+          const lock = sk.pendingMilestone ? ` [LOCKED @${sk.pendingMilestone}]` : "";
+          const from = sk.displayName !== sk.baseName ? ` (from ${sk.baseName})` : "";
+          return `- ${sk.displayName} ${sk.level}${lock}${from}`;
+        })
+        .join(NL);
+      pushLine("out", lines || "(no skills)");
+      return;
+    }
+
+    if (cmd === "feats") {
+      const owned = new Set(sheet.featsOwned || []);
+      const cat = FEATS.map((f) => `${owned.has(f.id) ? "*" : "-"} ${f.id}  ${f.name}  (${f.cost} CP)  [${f.tag}]`).join(NL);
+      pushLine("out", `FEATS (catalog)${NL}${cat}${NL}${NL}Owned: ${(sheet.featsOwned || []).join(", ") || "(none)"}`);
+      return;
+    }
+
+    if (cmd === "clear") {
+      setTerminal([]);
+      return;
+    }
+
+    if (cmd === "whoami") {
+      pushLine("out", `ROLE: ${role}${NL}STATUS: ${statusText}${NL}CHARACTER: ${sheet.name} (${sheet.id})`);
+      return;
+    }
+
+    if (cmd === "connect") {
+      const url = parts.slice(1).join(" ");
+      if (url) setWsUrl(url);
+      connect(url || wsUrl);
+      return;
+    }
+
+    if (cmd === "disconnect") {
+      disconnect();
+      return;
+    }
+
+    if (cmd === "request") {
+      const bodyText = line.slice("request".length).trim();
+      const body = safeJsonParse(bodyText);
+      if (!body) {
+        pushLine("err", "Invalid JSON.");
+        return;
+      }
+      if (body.type === "player_request") send(body);
+      else requestAction(body.action || body);
+      return;
+    }
+
+    if (cmd === "add" && parts[1] && parts[1].toLowerCase() === "item") {
+      const item = line.slice("add item".length).trim();
+      if (!item) {
+        pushLine("err", "Usage: add item <name>");
+        return;
+      }
+      runLocalOrRequest(
+        "add_item",
+        (s) => applyDmPatch(s, { addItems: [item] }),
+        { kind: "add_item", value: item }
+      );
+      return;
+    }
+
+    if (cmd === "remove" && parts[1] && parts[1].toLowerCase() === "item") {
+      const item = line.slice("remove item".length).trim();
+      if (!item) {
+        pushLine("err", "Usage: remove item <name>");
+        return;
+      }
+      runLocalOrRequest(
+        "remove_item",
+        (s) => applyDmPatch(s, { removeItems: [item] }),
+        { kind: "remove_item", value: item }
+      );
+      return;
+    }
+
+    if (cmd === "note") {
+      const text = line.slice("note".length).trim();
+      if (!text) {
+        pushLine("err", "Usage: note <text>");
+        return;
+      }
+      runLocalOrRequest("note", (s) => applyDmPatch(s, { note: text }), { kind: "note", value: text });
+      return;
+    }
+
+    if (cmd === "portrait") {
+      const url = line.slice("portrait".length).trim();
+      if (!url) {
+        pushLine("err", "Usage: portrait <url>");
+        return;
+      }
+      runLocalOrRequest(
+        "set_portrait",
+        (s) => applyDmPatch(s, { portraitUrl: url }),
+        { kind: "set_portrait", value: url }
+      );
+      return;
+    }
+
+    if (cmd === "vit" || cmd === "ast") {
+      const delta = parseSignedInt(parts[1]);
+      if (delta === null) {
+        pushLine("err", `Usage: ${cmd} +N  (example: ${cmd} +2)`);
+        return;
+      }
+
+      if (cmd === "vit") {
+        const preview = applyVitDelta(sheet, delta);
+        const check = ensureBudget(preview);
+        if (!check.ok) {
+          pushLine("err", "Not enough CP for that.");
+          return;
+        }
+        runLocalOrRequest("vit_delta", () => preview, { kind: "vit_delta", delta });
+        pushLine("build", `VIT ${sheet.vit} -> ${preview.vit}  (CP rem ${check.dd.cpRemaining})`);
+        return;
+      }
+
+      if (cmd === "ast") {
+        const preview = applyAstDelta(sheet, delta);
+        const check = ensureBudget(preview);
+        if (!check.ok) {
+          pushLine("err", "Not enough CP for that.");
+          return;
+        }
+        runLocalOrRequest("ast_delta", () => preview, { kind: "ast_delta", delta });
+        pushLine("build", `AST ${sheet.ast} -> ${preview.ast}  (CP rem ${check.dd.cpRemaining})`);
+        return;
+      }
+    }
+
+    if (cmd === "skill") {
+      const delta = parseSignedInt(parts[1]);
+      const name = parts.slice(2).join(" ");
+      if (delta === null || !name) {
+        pushLine("err", "Usage: skill +N <name>  (example: skill +1 melee weapons)" );
+        return;
+      }
+
+      const found = findSkillByUserInput(sheet, name);
+      if (!found) {
+        pushLine("err", `Unknown skill: ${name}`);
+        return;
+      }
+
+      const { id: skillId, sk } = found;
+
+      if (delta > 0 && sk.pendingMilestone) {
+        pushLine("err", `Skill is locked at ${sk.pendingMilestone}. Use: spec ${sk.baseName}`);
+        return;
+      }
+
+      const preview = applySkillDelta(sheet, skillId, delta);
+      const check = ensureBudget(preview);
+      if (!check.ok) {
+        pushLine("err", "Not enough CP for that.");
+        return;
+      }
+
+      const after = preview.skills[skillId];
+      runLocalOrRequest("skill_delta", () => preview, { kind: "skill_delta", skillId, delta });
+
+      const lock = after.pendingMilestone ? ` (LOCKED @${after.pendingMilestone})` : "";
+      pushLine("build", `${sk.displayName} ${sk.level} -> ${after.level}${lock}  (CP rem ${check.dd.cpRemaining})`);
+      if (after.pendingMilestone) pushLine("sys", `Reached milestone ${after.pendingMilestone}. Choose: spec ${after.baseName}`);
+      return;
+    }
+
+    if (cmd === "spec") {
+      const skillQuery = parts.slice(1).join(" ");
+      if (!skillQuery) {
+        pushLine("err", "Usage: spec <skill> [choice]" );
+        return;
+      }
+
+      // If choice is provided, we assume: spec <skill words...> <choice words...>
+      // To keep it simple, we try to resolve the skill from the left side progressively.
+      const tokens = parts.slice(1);
+      let found = null;
+      let splitAt = -1;
+      for (let i = tokens.length; i >= 1; i--) {
+        const left = tokens.slice(0, i).join(" ");
+        const maybe = findSkillByUserInput(sheet, left);
+        if (maybe) {
+          found = maybe;
+          splitAt = i;
+          break;
+        }
+      }
+
+      if (!found) {
+        pushLine("err", `Unknown skill: ${skillQuery}`);
+        return;
+      }
+
+      const choice = tokens.slice(splitAt).join(" ").trim();
+      const { id: skillId, sk } = found;
+
+      if (!sk.pendingMilestone) {
+        pushLine("out", `${sk.displayName} is not pending a specialization.`);
+        return;
+      }
+
+      const def = SKILL_DEFS.find((x) => x.id === skillId);
+      const ms = sk.pendingMilestone;
+      const opts = def && def.specs && def.specs[ms] ? def.specs[ms] : [];
+
+      if (!choice) {
+        const list = opts.map((x) => `  - ${x}  (-> ${def.domain} : ${x} ${ms + 1})`).join(NL);
+        pushLine("out", `Choose specialization for ${sk.baseName} @${ms} (FREE, promotes +1):${NL}${list}${NL}${NL}Use: spec ${sk.baseName} <choice>`);
+        return;
+      }
+
+      const preview = chooseSpec(sheet, skillId, choice);
+      const after = preview.skills[skillId];
+      if (after.pendingMilestone) {
+        pushLine("err", `Invalid choice. Use: spec ${sk.baseName}`);
+        return;
+      }
+
+      runLocalOrRequest("spec_choose", () => preview, { kind: "spec_choose", skillId, choice });
+      pushLine("build", `${sk.baseName} ${ms} -> ${after.displayName} ${after.level} (free)`);
+      return;
+    }
+
+    if (cmd === "feat") {
+      const sub = parts[1] ? parts[1].toLowerCase() : "";
+      const id = parts[2];
+      if (!sub || !id) {
+        pushLine("err", "Usage: feat buy <id>  |  feat sell <id>" );
+        return;
+      }
+
+      if (sub === "buy") {
+        const preview = buyFeat(sheet, id);
+        const check = ensureBudget(preview);
+        if (!check.ok) {
+          pushLine("err", "Not enough CP for that.");
+          return;
+        }
+        runLocalOrRequest("feat_buy", () => preview, { kind: "feat_buy", featId: id });
+        pushLine("build", `Bought feat ${id} (CP rem ${check.dd.cpRemaining})`);
+        return;
+      }
+
+      if (sub === "sell") {
+        const preview = sellFeat(sheet, id);
+        const check = ensureBudget(preview);
+        runLocalOrRequest("feat_sell", () => preview, { kind: "feat_sell", featId: id });
+        pushLine("build", `Sold feat ${id} (CP rem ${check.dd.cpRemaining})`);
+        return;
+      }
+
+      pushLine("err", "Usage: feat buy <id>  |  feat sell <id>" );
+      return;
+    }
+
+    if (cmd === "set") {
+      if (role !== "DM") {
+        pushLine("err", "Only DM can use set.");
+        return;
+      }
+      const field = parts[1] ? parts[1].toLowerCase() : "";
+      const value = parts.slice(2).join(" ");
+      if (!field || !value) {
+        pushLine("err", "Usage: set <field> <value>" );
+        return;
+      }
+
+      if (field === "name") {
+        setSheet((s) => ({ ...s, name: value }));
+        return;
+      }
+
+      if (field === "level") {
+        setSheet((s) => applyDmPatch(s, { level: Number(value) }));
+        return;
+      }
+
+      if (field === "hp") {
+        const pair = parseHpMpPair(value);
+        if (!pair) {
+          pushLine("err", "Usage: set hp <cur>/<max>" );
+          return;
+        }
+        setSheet((s) => applyDmPatch(s, { hp: { current: pair.cur, max: pair.max } }));
+        return;
+      }
+
+      if (field === "mp") {
+        const pair = parseHpMpPair(value);
+        if (!pair) {
+          pushLine("err", "Usage: set mp <cur>/<max>" );
+          return;
+        }
+        setSheet((s) => applyDmPatch(s, { mp: { current: pair.cur, max: pair.max } }));
+        return;
+      }
+
+      pushLine("err", `Unknown field: ${field}`);
+      return;
+    }
+
+    if (cmd === "cond") {
+      if (role !== "DM") {
+        pushLine("err", "Only DM can use cond.");
+        return;
+      }
+      const sub = parts[1] ? parts[1].toLowerCase() : "";
+      const id = parts[2];
+      if (!sub || !id) {
+        const list = CONDITIONS.map((c) => `- ${c.id} (${c.label})`).join(NL);
+        pushLine("out", `Usage: cond add <id> | cond rm <id>${NL}${NL}Available:${NL}${list}`);
+        return;
+      }
+      const allowed = new Set(CONDITIONS.map((c) => c.id));
+      if (!allowed.has(id)) {
+        pushLine("err", `Unknown condition id: ${id}`);
+        return;
+      }
+      if (sub === "add") {
+        setSheet((s) => ({ ...s, conditions: Array.from(new Set([...(s.conditions || []), id])) }));
+        pushLine("dm", `Condition added: ${id}`);
+        return;
+      }
+      if (sub === "rm") {
+        setSheet((s) => ({ ...s, conditions: (s.conditions || []).filter((x) => x !== id) }));
+        pushLine("dm", `Condition removed: ${id}`);
+        return;
+      }
+      pushLine("err", "Usage: cond add <id> | cond rm <id>" );
+      return;
+    }
+
+    if (cmd === "patch") {
+      if (role !== "DM") {
+        pushLine("err", "Only DM can use patch.");
+        return;
+      }
+      const bodyText = line.slice("patch".length).trim();
+      const p = safeJsonParse(bodyText);
+      if (!p) {
+        pushLine("err", "Usage: patch <json>" );
+        return;
+      }
+      setSheet((s) => applyDmPatch(s, p));
+      pushLine("sys", `Applied local patch: ${JSON.stringify(p)}`);
+      return;
+    }
+
+    pushLine("err", "Unknown command. Type help.");
+  }
+
+  function onSubmit(e) {
+    e.preventDefault();
+    const raw = input;
+    setInput("");
+
+    const h = historyRef.current;
+    h.list = [raw, ...h.list].slice(0, 50);
+    h.idx = -1;
+
+    handleCommand(raw);
+  }
+
+  function onKeyDown(e) {
+    const h = historyRef.current;
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      h.idx = Math.min(h.idx + 1, h.list.length - 1);
+      if (h.idx >= 0) setInput(h.list[h.idx]);
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      h.idx = Math.max(h.idx - 1, -1);
+      if (h.idx === -1) setInput("");
+      else setInput(h.list[h.idx]);
+    }
+  }
+
+  useEffect(() => {
+    pushLine("sys", "Sheet booted. Type help.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const hpTone = sheet.hp.current <= 0 ? "bad" : sheet.hp.current < sheet.hp.max ? "warn" : "good";
+  const mpTone = sheet.mp.current < 0 ? "bad" : sheet.mp.current < sheet.mp.max ? "warn" : "good";
+  const cpTone = d.cpRemaining < 0 ? "bad" : d.cpRemaining === 0 ? "warn" : "good";
+
+  const Tag = ({ text, tone = "neutral" }) => {
+    const base = "rounded-full border px-2 py-1 text-[10px] font-medium";
+    const cls =
+      tone === "good"
+        ? "border-emerald-800 bg-emerald-950 text-emerald-200"
+        : tone === "warn"
+        ? "border-amber-800 bg-amber-950 text-amber-200"
+        : tone === "bad"
+        ? "border-rose-800 bg-rose-950 text-rose-200"
+        : "border-slate-800 bg-slate-950 text-slate-200";
+    return <span className={`${base} ${cls}`}>{text}</span>;
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="mx-auto max-w-6xl px-4 py-6">
+        <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <div className="text-2xl font-semibold tracking-tight">Character Sheet</div>
+            <div className="text-sm text-slate-400">Normal Mode (core) • CP allocation • Skill milestones</div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="rounded-full border border-slate-800 bg-slate-900 px-3 py-1 text-xs">
+              <span className="text-slate-400">STATUS:</span> {statusText}
+            </div>
+
+            <button
+              className={`rounded-full border px-3 py-1 text-xs transition ${
+                role === "PLAYER"
+                  ? "border-emerald-800 bg-emerald-950 text-emerald-200"
+                  : "border-slate-800 bg-slate-900 text-slate-200 hover:bg-slate-800"
+              }`}
+              onClick={() => setRole("PLAYER")}
+              title="Players can edit build (CP), notes, inventory."
+            >
+              PLAYER
+            </button>
+            <button
+              className={`rounded-full border px-3 py-1 text-xs transition ${
+                role === "DM"
+                  ? "border-fuchsia-800 bg-fuchsia-950 text-fuchsia-200"
+                  : "border-slate-800 bg-slate-900 text-slate-200 hover:bg-slate-800"
+              }`}
+              onClick={() => setRole("DM")}
+              title="DM can patch level, resources, conditions."
+            >
+              DM
+            </button>
+
+            <button
+              className="rounded-full border border-slate-800 bg-slate-900 px-3 py-1 text-xs hover:bg-slate-800"
+              onClick={() => {
+                setSheet(DEFAULT_SHEET);
+                pushLine("sys", "Reset sheet to defaults.");
+              }}
+            >
+              Reset
+            </button>
+          </div>
+        </header>
+
+        <main className="relative mt-5 grid gap-4 lg:grid-cols-[360px_1fr]">
+          {/* Left: always-visible sheet data */}
+          <div className="rounded-2xl border border-slate-800 bg-slate-950/50 shadow-xl">
+            <div className="p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm text-slate-400">Character</div>
+                  <div className="text-xl font-semibold">{sheet.name}</div>
+                  <div className="mt-1 text-xs text-slate-500">ID {sheet.id}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs text-slate-400">Level</div>
+                  <div className="text-2xl font-semibold">{sheet.level}</div>
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Tag text={`HP ${sheet.hp.current}/${sheet.hp.max}`} tone={hpTone} />
+                <Tag text={`MP ${sheet.mp.current}/${sheet.mp.max}`} tone={mpTone} />
+                <Tag text={`CP ${d.cpSpent}/${d.cpTotal} (rem ${d.cpRemaining})`} tone={cpTone} />
+              </div>
+
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Tag text={`Status: ${d.statuses.join(", ")}`} tone={d.statuses.includes("Good") ? "good" : "warn"} />
+                <Tag text={`Cond: ${d.condLabels.length ? d.condLabels.join(", ") : "None"}`} tone={d.condLabels.length ? "bad" : "neutral"} />
+              </div>
+
+              <div className="mt-4 grid gap-2 rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold tracking-widest text-slate-300">PRIMARY</div>
+                  <div className="text-[10px] text-slate-500">min-pair</div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 text-sm">
+                  <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2">
+                    <div className="text-[10px] text-slate-500">Body</div>
+                    <div className="text-lg font-semibold">{d.body}</div>
+                    <div className="text-[10px] text-slate-500">min(STR,AGI)</div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2">
+                    <div className="text-[10px] text-slate-500">Mind</div>
+                    <div className="text-lg font-semibold">{d.mind}</div>
+                    <div className="text-[10px] text-slate-500">min(INT,PER)</div>
+                  </div>
+                  <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2">
+                    <div className="text-[10px] text-slate-500">Spirit</div>
+                    <div className="text-lg font-semibold">{d.spirit}</div>
+                    <div className="text-[10px] text-slate-500">min(WIS,CHA)</div>
+                  </div>
+                </div>
+
+                <div className="mt-1 rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-300">
+                  STR {sheet.attrs.STR}  AGI {sheet.attrs.AGI}  INT {sheet.attrs.INT}  PER {sheet.attrs.PER}  WIS {sheet.attrs.WIS}  CHA {sheet.attrs.CHA}
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2">
+                  <div className="text-xs text-slate-400">Vitality (VIT)</div>
+                  <div className="mt-1 flex items-baseline justify-between">
+                    <div className="text-xl font-semibold">{sheet.vit}</div>
+                    <div className="text-[10px] text-slate-500">CP sink</div>
+                  </div>
+                </div>
+                <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2">
+                  <div className="text-xs text-slate-400">Astra (AST)</div>
+                  <div className="mt-1 flex items-baseline justify-between">
+                    <div className="text-xl font-semibold">{sheet.ast}</div>
+                    <div className="text-[10px] text-slate-500">CP sink</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold tracking-widest text-slate-300">PENDING</div>
+                  <div className="text-[10px] text-slate-500">10 / 25 / 40</div>
+                </div>
+                                {d.pendingSpecs.length ? (
+                  <ul className="mt-2 space-y-1 text-sm">
+                    {d.pendingSpecs.map((p) => (
+                      <li
+                        key={p.id}
+                        className="flex items-center justify-between gap-2 rounded-lg border border-amber-900/50 bg-amber-950/30 px-2 py-1"
+                      >
+                        <span className="text-amber-200">
+                          {p.displayName} <span className="text-amber-300">@{p.at}</span>
+                        </span>
+                        <span className="font-mono text-[10px] text-amber-300">spec {p.baseName}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="mt-2 text-sm text-slate-400">None</div>
+                )}
+              </div>
+
+              <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold tracking-widest text-slate-300">FEATS</div>
+                  <div className="text-[10px] text-slate-500">variable</div>
+                </div>
+                <div className="mt-2 text-sm text-slate-200">
+                  {(sheet.featsOwned || []).length ? (
+                    <ul className="space-y-1">
+                      {sheet.featsOwned.map((id) => {
+                        const f = FEATS.find((x) => x.id === id);
+                        return (
+                          <li
+                            key={id}
+                            className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950 px-2 py-1"
+                          >
+                            <span>{f ? f.name : id}</span>
+                            <span className="text-[10px] text-slate-500">{f ? f.cost : "?"} CP</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  ) : (
+                    <div className="text-slate-400">None</div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-3 text-xs text-slate-500">
+                CP curve: +10 per level (≤50), +15 (51–100), +20 (101+). Current rate: +{d.cpRate}.
+              </div>
+            </div>
+          </div>
+
+          {/* Right: Terminal + portrait overlay */}
+          <div className="relative rounded-2xl border border-slate-800 bg-slate-950/50 shadow-xl">
+            <div className="pointer-events-none absolute right-4 top-4 z-20">
+              <div className="pointer-events-auto">
+                <motion.div
+                  initial={{ opacity: 0, y: -8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="w-48 overflow-hidden rounded-2xl border border-slate-700 bg-slate-900/60 shadow-2xl backdrop-blur"
+                >
+                  <div className="border-b border-slate-800 px-3 py-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-[10px] font-semibold tracking-widest text-slate-300">PORTRAIT</div>
+                      <div className="text-[10px] text-slate-400">{sheet.name}</div>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      <Tag text={`HP ${sheet.hp.current}/${sheet.hp.max}`} tone={hpTone} />
+                      <Tag text={`MP ${sheet.mp.current}/${sheet.mp.max}`} tone={mpTone} />
+                      <Tag
+                        text={d.statuses.includes("Good") ? "Condition: Good" : `Status: ${d.statuses.join(", ")}`}
+                        tone={d.statuses.includes("Good") ? "good" : "warn"}
+                      />
+                    </div>
+                  </div>
+                  <div className="aspect-square w-full">
+                    <img
+                      src={sheet.portraitUrl}
+                      alt="portrait"
+                      className="h-full w-full object-cover"
+                      onError={(e) => {
+                        e.currentTarget.src = DEFAULT_SHEET.portraitUrl;
+                      }}
+                    />
+                  </div>
+                </motion.div>
+              </div>
+            </div>
+
+            <div className="p-4 sm:p-5">
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <Tag text={`LEVEL ${sheet.level}`} tone="neutral" />
+                <Tag text={`CP REM ${d.cpRemaining}`} tone={cpTone} />
+                {d.pendingSpecs.length ? (
+                  <Tag text={`PENDING ${d.pendingSpecs.length}`} tone="warn" />
+                ) : (
+                  <Tag text="NO PENDING" tone="good" />
+                )}
+              </div>
+
+              <div
+                ref={scrollRef}
+                className="h-[58vh] overflow-auto rounded-xl border border-slate-800 bg-slate-950 px-3 py-3 font-mono text-sm leading-relaxed"
+              >
+                <AnimatePresence initial={false}>
+                  {terminal.map((l) => (
+                    <motion.div
+                      key={l.id}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className="mb-1 whitespace-pre-wrap"
+                    >
+                      <span className="mr-2 text-[10px] text-slate-600">[{l.ts}]</span>
+                      <span
+                        className={
+                          l.kind === "cmd"
+                            ? "text-slate-100"
+                            : l.kind === "out"
+                            ? "text-slate-200"
+                            : l.kind === "dm"
+                            ? "text-fuchsia-200"
+                            : l.kind === "err"
+                            ? "text-rose-200"
+                            : l.kind === "build"
+                            ? "text-amber-200"
+                            : "text-emerald-200"
+                        }
+                      >
+                        {l.text}
+                      </span>
+                    </motion.div>
+                  ))}
+                </AnimatePresence>
+              </div>
+
+              <form onSubmit={onSubmit} className="mt-3 flex items-center gap-2">
+                <div className="rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-400">
+                  &gt;
+                </div>
+                <input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={onKeyDown}
+                  className="w-full rounded-xl border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none focus:border-slate-600"
+                  placeholder={
+                    role === "PLAYER"
+                      ? "Try: sheet | cp | skill +1 melee | vit +2 | feats | feat buy quick_hands | spec melee weapons"
+                      : "DM: set level 20 | set mp -2/6 | cond add poisoned | patch {...}"
+                  }
+                  autoFocus
+                />
+                <button
+                  type="submit"
+                  className="rounded-xl border border-slate-800 bg-slate-900 px-4 py-2 text-sm hover:bg-slate-800"
+                >
+                  Send
+                </button>
+              </form>
+
+              <div className="mt-3 flex flex-col gap-2 text-xs text-slate-400 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <span className="text-slate-500">Tip:</span> Up and Down arrows browse history. Type{" "}
+                  <span className="text-slate-200">help</span>.
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1">Body {d.body}</div>
+                  <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1">Mind {d.mind}</div>
+                  <div className="rounded-lg border border-slate-800 bg-slate-950 px-2 py-1">Spirit {d.spirit}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+           
